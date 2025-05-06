@@ -26,6 +26,10 @@ struct PrintCommand {
     bool is_control_seq; // Not used for windows, but used to denote ANSI control codes
 };
 
+/*
+* @brief: safe_printf is a non-blocking, thread safe way of printing to the console.
+* fill the buffer, put it in the print queue.
+*/
 void safe_printf(const char* format, ...) {
     PrintCommand cmd = { 0 };
     va_list args;
@@ -37,6 +41,9 @@ void safe_printf(const char* format, ...) {
     xQueueSend(xPrintQueue, &cmd, pdMS_TO_TICKS(10));
 }
 
+/*
+* @brief: same idea as safe_printf, but more 'direct' because it handles control codes. 
+*/
 void safe_print_control_code(const char* control_code, ...) {
     PrintCommand cmd = { 0 };
     strncpy(cmd.buffer, control_code, PRINT_BUF_SIZE);
@@ -49,7 +56,6 @@ static TempSensor temp_sensor;
 static LightSensor light_sensor;
 static HumiditySensor humidity_sensor;
 
-
 struct DashboardData {
     float temp;
     float humidity;
@@ -60,11 +66,12 @@ struct DashboardData {
 static DashboardData dashboard_data;
 static SemaphoreHandle_t xDashboardMutex;
 
+/*
+* @brief: RTOS task for handling printing to console without blocking
+*/
 extern "C" void vPrintTask(void* pvParameters) {
     PrintCommand cmd;
     while (1) {
-        UBaseType_t messages = uxQueueMessagesWaiting(xPrintQueue);
-        printf("[PRINT] Queue: %u/%u messages\n", messages, PRINT_QUEUE_LEN);
         if (xQueueReceive(xPrintQueue, &cmd, portMAX_DELAY) == pdPASS) {
             if (cmd.is_control_seq) {
                 fputs(cmd.buffer, stdout); // control sequences should go through, no formatting
@@ -77,6 +84,10 @@ extern "C" void vPrintTask(void* pvParameters) {
     }
 }
 
+/*
+* @brief: RTOS task for displaying the dashboard, uses semaphores to ensure atomic access to
+* global dashboard_data struct.
+*/
 extern "C" void vDashboardTask(void* pvParameters) {
     const TickType_t xUpdateFrequency = pdMS_TO_TICKS(1000);
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -85,24 +96,24 @@ extern "C" void vDashboardTask(void* pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(200));
 
     while (1) {
-        printf("DASH - Taking mutex....\n");
         if ( xSemaphoreTake(xDashboardMutex, pdMS_TO_TICKS(100)) == pdTRUE ){
-            printf("DASH - Mutex get, display code\n");
             // clear screen
-            // safe_print_control_code("\033[2J\033[H");
+            safe_print_control_code("\033[2J\033[H");
+            // Print Dashboard
             safe_printf("=== Potted Plant Environmental Dashboard ===\n");
             safe_printf("Temperature: %.1f C\n", dashboard_data.temp);
             safe_printf("Light Level: %.1f lux\n", dashboard_data.light);
-            safe_printf("Humidity:    %.1f %\n", dashboard_data.humidity);
+            safe_printf("Humidity:    %.1f %% \n", dashboard_data.humidity); // always forget about escaping % sign...
             xSemaphoreGive(xDashboardMutex);
-            printf("DASH - mutex released\n");
-        } else {
-            printf("DASH - failed to get mutex\n");
         }
         vTaskDelayUntil(&xLastWakeTime, xUpdateFrequency);
     }
 }
 
+/*
+* @brief: RTOS task for polling data from the sensor suite. Round robin access when reading from sensors. 
+* Takes in data and places it in the RawDataQueue to be processed.
+*/
 extern "C" void vSensorTask(void* pvParameters) {
     Sensor* sensors[] = { &temp_sensor, &light_sensor, &humidity_sensor };
     const TickType_t xDelay = pdMS_TO_TICKS(100);
@@ -116,59 +127,54 @@ extern "C" void vSensorTask(void* pvParameters) {
     }
 }
 
+/*
+* @brief: RTOS task that takes in data from the RawDataQueue and applys various filters to the data. 
+* Places processed data on the ProcessedDataQueue.
+* Currently nothing is utilizing the data in the ProcessedDataQueue, will be utilized for 'live' sensor viewing or other tasks.
+*/
 extern "C" void vProcessorTask(void* pvParameters) {
-    static MovingAverage<5> temperature_filter;
-    static MovingAverage<5> humidity_filter;
-    static MovingAverage<5> light_filter;
+    static MovingAverage<float, 5> temperature_filter;
+    static MovingAverage<float, 5> humidity_filter;
+    static MovingAverage<float, 5> light_filter;
     Sensor::Data data;
-    uint32_t update_count = 0; //dbg
 
     while (1) {
         if (xQueueReceive(xRawDataQueue, &data, portMAX_DELAY) == pdPASS) {
-            bool dash_updated = false; // dbg
             switch (data.type) {
             case Sensor::Type::TEMPERATURE:
-                data.value = temperature_filter.process(data.value);
+                data.value = temperature_filter.addSample(data.value);
                 if (xSemaphoreTake(xDashboardMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     dashboard_data.temp = data.value;
                     dashboard_data.last_update = xTaskGetTickCount();
                     xSemaphoreGive(xDashboardMutex);
-                    dash_updated = true; // dbg
                 }
                 break;
             case Sensor::Type::LIGHT:
-                data.value = light_filter.process(data.value);
+                data.value = light_filter.addSample(data.value);
                 if (xSemaphoreTake(xDashboardMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     dashboard_data.light = data.value;
                     dashboard_data.last_update = xTaskGetTickCount();
                     xSemaphoreGive(xDashboardMutex);
-                    dash_updated = true; // dbg
                 }
                 break;
             case Sensor::Type::HUMIDITY:
-                data.value = humidity_filter.process(data.value);
+                data.value = humidity_filter.addSample(data.value);
                 if (xSemaphoreTake(xDashboardMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     dashboard_data.humidity = data.value;
                     dashboard_data.last_update = xTaskGetTickCount();
                     xSemaphoreGive(xDashboardMutex);
-                    dash_updated = true; // dbg
                 }
                 break;
             }
-
-            // Debug output every 10 updates
-            if (++update_count % 1 == 0) {
-                safe_printf("[PROC] Processed: %s=%.1f (Dashboard %s)\n",
-                    data.type == Sensor::Type::TEMPERATURE ? "TEMP" :
-                    data.type == Sensor::Type::HUMIDITY ? "HUM" : "LIGHT",
-                    data.value,
-                    dash_updated ? "UPDATED" : "SKIPPED");
-            }
-            xQueueSend(xProcessedDataQueue, &data, 0);
+            xQueueSend(xProcessedDataQueue, &data, pdMS_TO_TICKS(100));
         }
     }
 }
 
+/*
+* @brief: FreeRTOS setup and entrypoint.
+* initilized data queues, creates our semaphore, registers tasks, then starts the scheduler.
+*/
 void vMain(void) {
     xPrintQueue = xQueueCreate(PRINT_QUEUE_LEN, sizeof(PrintCommand));
     xRawDataQueue = xQueueCreate(5, sizeof(Sensor::Data));
@@ -176,8 +182,8 @@ void vMain(void) {
 
     xDashboardMutex = xSemaphoreCreateMutex();
     xTaskCreate(vDashboardTask, "Dashboard", 1024, NULL, 1, NULL);
-    xTaskCreate(vSensorTask, "Sensor", 1024, NULL, 3, NULL); 
     xTaskCreate(vProcessorTask, "Processor", 1024, NULL, 2, NULL);
+    xTaskCreate(vSensorTask, "Sensor", 1024, NULL, 3, NULL);    
     xTaskCreate(vPrintTask, "Print", 1024, NULL, 4, NULL);
 
     vTaskStartScheduler();

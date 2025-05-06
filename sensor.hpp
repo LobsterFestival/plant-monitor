@@ -2,6 +2,10 @@
 #include <cstdint>
 #include <string>
 
+/*
+* @brief: The Sensor class is the base class for all mock sensors, it provides the structure for sensor Data.
+* Currently has an enum relating to sensor type for convinence in debugging, but is an example of coupled code.
+*/
 class Sensor {
 public:
     enum class Type { TEMPERATURE, LIGHT, HUMIDITY };

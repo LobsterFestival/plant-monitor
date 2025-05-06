@@ -1,0 +1,7 @@
+*.a
+/Debug
+main_blinky.c
+main_full.c
+Run-time-stats-utils.c
+/.vs
+*.dump
